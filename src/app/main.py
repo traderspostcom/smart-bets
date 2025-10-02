@@ -95,3 +95,6 @@ def picks(
 
 from .live import picks_live_router
 app.include_router(picks_live_router)
+
+from .admin import admin_router
+app.include_router(admin_router)
