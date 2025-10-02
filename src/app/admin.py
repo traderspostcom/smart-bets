@@ -11,15 +11,12 @@ def _require_token(x_cron_token: str | None):
 
 def _run(cmd: list[str]):
     p = run(cmd, stdout=PIPE, stderr=PIPE, text=True)
-    if p.returncode != 0:
-        raise CalledProcessError(p.returncode, cmd, output=p.stdout, stderr=p.stderr)
-    return {"cmd": " ".join(cmd), "stdout": p.stdout[-1000:], "stderr": p.stderr[-1000:]}
+    return p.returncode, p.stdout[-4000:], p.stderr[-4000:]
 
 @admin_router.post("/admin/refresh")
 def refresh(x_cron_token: str | None = Header(default=None)):
     _require_token(x_cron_token)
 
-    # Pull odds for NFL/NHL/MLB/NBA/NCAAF (you can tune later)
     sports = [
         "americanfootball_nfl",
         "icehockey_nhl",
@@ -30,6 +27,15 @@ def refresh(x_cron_token: str | None = Header(default=None)):
     cmd1 = ["python", "-m", "src.etl.pull_odds_to_csv", "--sports", *sports]
     cmd2 = ["python", "-m", "src.features.make_baseline_from_odds"]
 
-    out1 = _run(cmd1)
-    out2 = _run(cmd2)
-    return {"ok": True, "steps": [out1, out2]}
+    code1, out1, err1 = _run(cmd1)
+    if code1 != 0:
+        return {"ok": False, "step": "pull_odds", "code": code1, "stdout": out1, "stderr": err1}
+
+    code2, out2, err2 = _run(cmd2)
+    if code2 != 0:
+        return {"ok": False, "step": "baseline", "code": code2, "stdout": out2, "stderr": err2}
+
+    return {"ok": True, "steps": [
+        {"cmd": " ".join(cmd1), "stdout": out1, "stderr": err1},
+        {"cmd": " ".join(cmd2), "stdout": out2, "stderr": err2},
+    ]}
