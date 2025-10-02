@@ -1,0 +1,39 @@
+
+# Minimal configuration
+env: ${ENV:dev}
+
+paths:
+  data_dir: ./data
+  raw: ./data/raw
+  processed: ./data/processed
+  artifacts: ./data/model_artifacts
+
+model:
+  type: xgboost
+  params:
+    n_estimators: 300
+    max_depth: 5
+    learning_rate: 0.06
+    subsample: 0.9
+    colsample_bytree: 0.9
+  target: home_win
+  features:
+    - home_rating
+    - away_rating
+    - rest_diff
+    - travel_miles
+    - weather_wind
+    - market_implied_q_novig # baseline comparison feature (optional)
+
+betting:
+  min_edge: 0.015
+  kelly_fraction: 0.25
+  max_risk_per_market: 0.02
+  daily_risk_cap: 0.08
+  books: ["ToyBook"]
+
+backtest:
+  decision_interval_minutes: 60
+  latency_seconds: 90
+
+# You can control The Odds API pull via env vars above.
