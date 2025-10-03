@@ -1,3 +1,4 @@
+from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Query
 from subprocess import run, PIPE
 from pathlib import Path
@@ -6,13 +7,13 @@ import os
 admin_router = APIRouter()
 
 # ---------- Auth ----------
-def _require_token(x_cron_token: str | None):
+def _require_token(x_cron_token: Optional[str]):
     expected = os.getenv("CRON_TOKEN")
     if not expected or not x_cron_token or x_cron_token != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 # ---------- Helpers ----------
-def _run(cmd: list[str]):
+def _run(cmd):
     """
     Run a subprocess and capture the last 4000 chars of stdout/stderr so we can
     debug issues without crashing the app.
@@ -22,7 +23,7 @@ def _run(cmd: list[str]):
 
 # ---------- Inspect files ----------
 @admin_router.get("/admin/list_files")
-def list_files(x_cron_token: str | None = Header(default=None)):
+def list_files(x_cron_token: Optional[str] = Header(default=None)):
     _require_token(x_cron_token)
     root = Path("./data")
     out = {}
@@ -39,7 +40,7 @@ def list_files(x_cron_token: str | None = Header(default=None)):
 # ---------- Safe full-game refresh (one sport) ----------
 @admin_router.post("/admin/refresh_fullgame_safe")
 def refresh_fullgame_safe(
-    x_cron_token: str | None = Header(default=None),
+    x_cron_token: Optional[str] = Header(default=None),
     sport: str = Query("baseball_mlb", description="One sport key, e.g. baseball_mlb, basketball_nba"),
 ):
     """
@@ -76,7 +77,7 @@ def refresh_fullgame_safe(
 # ---------- First-half / F5 refresh (bounded) ----------
 @admin_router.post("/admin/refresh_firsthalf")
 def refresh_firsthalf(
-    x_cron_token: str | None = Header(default=None),
+    x_cron_token: Optional[str] = Header(default=None),
     sport: str = Query("baseball_mlb", description="Supported: baseball_mlb for F5"),
     max_events: int = Query(30, ge=1, le=100),
 ):
