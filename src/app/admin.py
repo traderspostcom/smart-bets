@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Header, HTTPException
 from subprocess import run, PIPE
+from pathlib import Path
 import os
 
 admin_router = APIRouter()
@@ -10,22 +11,33 @@ def _require_token(x_cron_token: str | None):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def _run(cmd: list[str]):
-    """Run a subprocess and capture last 4000 chars of stdout/stderr."""
     p = run(cmd, stdout=PIPE, stderr=PIPE, text=True)
     return p.returncode, p.stdout[-4000:], p.stderr[-4000:]
+
+@admin_router.get("/admin/list_files")
+def list_files(x_cron_token: str | None = Header(default=None)):
+    """
+    List files under ./data to see what's actually on disk.
+    """
+    _require_token(x_cron_token)
+    root = Path("./data")
+    out = {}
+    for sub in ["raw", "processed", "model_artifacts"]:
+        p = root / sub
+        if p.exists():
+            out[sub] = sorted([str(x.relative_to(root)) for x in p.rglob("*") if x.is_file()])[:500]
+        else:
+            out[sub] = []
+    return {"ok": True, "files": out}
 
 @admin_router.post("/admin/refresh")
 def refresh(x_cron_token: str | None = Header(default=None)):
     """
-    Refresh FULL-GAME markets:
-      - Pull latest odds for NFL, NHL, MLB, NBA, NCAAF
-      - Build no-vig baselines (full-game moneyline)
+    Refresh FULL-GAME markets (moneyline only).
     """
     _require_token(x_cron_token)
 
-    # Respect your regions preference; default to us,eu
     regions = os.getenv("ODDS_API_REGIONS", "us,eu")
-
     sports = [
         "americanfootball_nfl",
         "icehockey_nhl",
@@ -33,7 +45,6 @@ def refresh(x_cron_token: str | None = Header(default=None)):
         "basketball_nba",
         "americanfootball_ncaaf",
     ]
-    # IMPORTANT: force markets to 'h2h' here (no period markets on this endpoint)
     cmd1 = ["python", "-m", "src.etl.pull_odds_to_csv",
             "--sports", *sports,
             "--regions", regions,
@@ -56,15 +67,28 @@ def refresh(x_cron_token: str | None = Header(default=None)):
 @admin_router.post("/admin/refresh_firsthalf")
 def refresh_firsthalf(x_cron_token: str | None = Header(default=None)):
     """
-    Refresh FIRST-HALF / F5 markets:
-      - TEMP: MLB F5 only for stability (can add NFL/NCAAF/NBA H1 later)
-      - Pull period odds, then build no-vig baselines for first-half/F5
+    Refresh FIRST-HALF / F5 markets (currently MLB F5 for stability).
     """
     _require_token(x_cron_token)
 
     regions = os.getenv("ODDS_API_REGIONS", "us,eu")
+    sports = ["baseball_mlb"]
 
-    sports = [
-        "baseball_mlb",
-    ]
-    # Pass a bounded number of e
+    cmd1 = ["python", "-m", "src.etl.pull_period_odds_to_csv",
+            "--sports", *sports,
+            "--regions", regions,
+            "--max_events", "30"]
+    cmd2 = ["python", "-m", "src.features.make_baseline_first_half"]
+
+    code1, out1, err1 = _run(cmd1)
+    if code1 != 0:
+        return {"ok": False, "step": "pull_period_odds", "code": code1, "stdout": out1, "stderr": err1}
+
+    code2, out2, err2 = _run(cmd2)
+    if code2 != 0:
+        return {"ok": False, "step": "baseline_firsthalf", "code": code2, "stdout": out2, "stderr": err2}
+
+    return {"ok": True, "steps": [
+        {"cmd": " ".join(cmd1), "stdout": out1, "stderr": err1},
+        {"cmd": " ".join(cmd2), "stdout": out2, "stderr": err2},
+    ]}
