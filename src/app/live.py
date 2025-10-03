@@ -1,103 +1,179 @@
-from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Query
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from pathlib import Path
-import pandas as pd
+# src/app/live.py
+from __future__ import annotations
+
 import os
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import pandas as pd
+from fastapi import APIRouter, Query
 
 picks_live_router = APIRouter()
 
-# ---------- Env-configurable defaults ----------
-DEF_FULLGAME_EDGE = float(os.getenv("PICKS_FULLGAME_MIN_EDGE", "0.015"))   # 1.5%
-DEF_FIRSTHALF_EDGE = float(os.getenv("PICKS_FIRSTHALF_MIN_EDGE", "0.010")) # 1.0%
-DEF_LIMIT = int(os.getenv("PICKS_DEFAULT_LIMIT", "50"))
-MIN_CONSENSUS_BOOKS = int(os.getenv("PICKS_MIN_CONSENSUS_BOOKS", "1"))
-MAX_AGE_MINUTES = int(os.getenv("PICKS_MAX_AGE_MINUTES", "0"))  # 0 = ignore
+# -----------------------------
+# Helpers: env + per-sport overrides
+# -----------------------------
+def _csv_env(name: str, default_csv: str = "") -> List[str]:
+    raw = os.getenv(name, default_csv).strip()
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
 
-class LivePick(BaseModel):
-    event_id: str
-    sport_key: str
-    home_team: str
-    away_team: str
-    book_key: str
-    home_q_novig: float
-    consensus_home_q: float
-    edge_vs_consensus: float
+def _int_env(name: str, default_val: int) -> int:
+    try:
+        return int(os.getenv(name, str(default_val)))
+    except Exception:
+        return default_val
 
-def _path_for(source: str) -> Path:
-    if source == "fullgame":
-        return Path("./data/processed/market_baselines_h2h.csv")
-    else:
-        return Path("./data/processed/market_baselines_firsthalf.csv")
+def _float_env(name: str, default_val: float) -> float:
+    try:
+        return float(os.getenv(name, str(default_val)))
+    except Exception:
+        return default_val
 
-def _load_df(source: str) -> pd.DataFrame:
-    path = _path_for(source)
-    if not path.exists():
-        raise FileNotFoundError(f"Missing file: {path}")
-    return pd.read_csv(path)
+def _get_per_sport(name_base: str, sport_key: Optional[str], fallback_val):
+    """
+    Look up env override like NAME__sport_key, else NAME.
+    Example: LIVE_MAX_AGE_MIN__baseball_mlb; falls back to LIVE_MAX_AGE_MIN.
+    """
+    if sport_key:
+        specific = f"{name_base}__{sport_key}"
+        if specific in os.environ and str(os.environ[specific]).strip() != "":
+            typ = type(fallback_val)
+            try:
+                if typ is int:
+                    return int(os.environ[specific])
+                if typ is float:
+                    return float(os.environ[specific])
+                if typ is list:
+                    return _csv_env(specific)
+                return os.environ[specific]
+            except Exception:
+                # if cast fails, fall back
+                pass
+    return fallback_val
 
+# -----------------------------
+# Config (globals with optional per-sport overrides)
+# -----------------------------
+# Global defaults (can be overridden globally or per sport)
+GLOBAL_ALLOWED_BOOKS = _csv_env("LIVE_ALLOWED_BOOKS", "")  # empty = all books
+GLOBAL_MIN_CONSENSUS = _int_env("LIVE_MIN_CONSENSUS_BOOKS", 2)
+GLOBAL_MAX_AGE_MIN = _int_env("LIVE_MAX_AGE_MIN", 120)
+GLOBAL_MIN_ABS_EDGE = _float_env("DEFAULT_MIN_ABS_EDGE", 0.015)
+GLOBAL_LIMIT = _int_env("DEFAULT_LIMIT", 20)
+
+# Input files
+PROCESSED_DIR = Path("data/processed")
+FULLGAME_FILE = PROCESSED_DIR / "market_baselines_h2h.csv"
+FIRSTHALF_FILE = PROCESSED_DIR / "market_baselines_firsthalf.csv"
+
+# -----------------------------
+# Core loader
+# -----------------------------
+def _load_baseline(source: str) -> Optional[pd.DataFrame]:
+    f = FIRSTHALF_FILE if source == "firsthalf" else FULLGAME_FILE
+    if not f.exists():
+        return None
+    try:
+        df = pd.read_csv(f)
+    except Exception:
+        return None
+    # Normalize expected columns if present
+    # Required columns we use below:
+    #   event_id, sport_key, home_team, away_team, book_key,
+    #   home_q_novig, consensus_home_q
+    missing = [c for c in ["event_id","sport_key","home_team","away_team","book_key","home_q_novig","consensus_home_q"] if c not in df.columns]
+    if missing:
+        # Try to adapt if file has slightly different names (no-op if not found)
+        # Keep it simple; return None if truly incompatible.
+        return None
+    return df
+
+# -----------------------------
+# Endpoint
+# -----------------------------
 @picks_live_router.get("/picks_live")
 def picks_live(
-    min_abs_edge: Optional[float] = Query(None, ge=0, le=1, description="Minimum absolute edge vs consensus."),
-    limit: Optional[int] = Query(None, ge=1, le=200, description="Max rows to return."),
-    source: str = Query("fullgame", pattern="^(fullgame|firsthalf)$", description="Which baseline file to use."),
+    source: str = Query("fullgame", pattern="^(fullgame|firsthalf)$", description="fullgame or firsthalf"),
+    sport: Optional[str] = Query(None, description="Optional sport_key filter, e.g. baseball_mlb"),
+    min_abs_edge: float = Query(None, ge=0, le=1, description="Override min |edge_vs_consensus|"),
+    limit: int = Query(None, ge=1, le=200, description="Max rows to return"),
 ):
     """
-    Returns rows where a book deviates from the event consensus (median of books).
-    Defaults come from environment variables on Render.
+    Returns rows from processed baselines with filters:
+    - Allowed books (global or per-sport)
+    - Min consensus books (global or per-sport)
+    - Max age minutes (global or per-sport) — enforced via file mtime
+    - Min absolute edge
+    - Optional sport filter
     """
-    # dynamic defaults from env
-    edge_default = DEF_FULLGAME_EDGE if source == "fullgame" else DEF_FIRSTHALF_EDGE
-    edge_thresh = float(edge_default if min_abs_edge is None else min_abs_edge)
-    row_limit = int(DEF_LIMIT if limit is None else limit)
+    df = _load_baseline("firsthalf" if source == "firsthalf" else "fullgame")
+    if df is None or df.empty:
+        return {"picks": [], "note": f"Missing or empty file: {('market_baselines_firsthalf.csv' if source=='firsthalf' else 'market_baselines_h2h.csv')}"}
 
+    # If sport query provided, filter early
+    if sport:
+        df = df[df["sport_key"] == sport]
+        if df.empty:
+            return {"picks": [], "note": f"No rows for sport={sport} after initial filter."}
+
+    # Resolve per-sport overrides (if sport filter set, use that; otherwise use globals)
+    # NOTE: When multiple sports are present in one response, we’ll use global defaults.
+    min_consensus = _get_per_sport("LIVE_MIN_CONSENSUS_BOOKS", sport, GLOBAL_MIN_CONSENSUS)
+    max_age_min = _get_per_sport("LIVE_MAX_AGE_MIN", sport, GLOBAL_MAX_AGE_MIN)
+    allowed_books = _get_per_sport("LIVE_ALLOWED_BOOKS", sport, GLOBAL_ALLOWED_BOOKS)
+
+    # Freshness gate (based on file mtime); if too old for the requested sport, return none.
     try:
-        df = _load_df(source)
-    except FileNotFoundError as e:
-        return JSONResponse(content={"picks": [], "note": str(e)})
+        fpath = FIRSTHALF_FILE if source == "firsthalf" else FULLGAME_FILE
+        age_minutes = max(0, int((pd.Timestamp.utcnow() - pd.Timestamp(fpath.stat().st_mtime, unit="s", tz="UTC")).total_seconds() // 60))
+        if age_minutes > max_age_min:
+            return {"picks": [], "note": f"Snapshot too old ({age_minutes} min > max {max_age_min}); run admin refresh."}
+    except Exception:
+        pass  # if we can’t compute age, we don’t block
 
-    # Optional freshness filter if column exists and MAX_AGE_MINUTES > 0
-    if MAX_AGE_MINUTES > 0 and "last_update" in df.columns:
-        ts = pd.to_datetime(df["last_update"], errors="coerce", utc=True)
-        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(minutes=MAX_AGE_MINUTES)
-        df = df[ts >= cutoff]
+    # Book filter (optional)
+    if isinstance(allowed_books, list) and allowed_books:
+        df = df[df["book_key"].isin(allowed_books)]
+        if df.empty:
+            return {"picks": [], "note": "No rows after allowed_books filter."}
 
-    # Require a minimum number of books contributing to the consensus
-    if MIN_CONSENSUS_BOOKS > 1 and "event_id" in df.columns:
-        counts = df.groupby("event_id").size()
-        keep_ids = set(counts[counts >= MIN_CONSENSUS_BOOKS].index)
-        df = df[df["event_id"].isin(keep_ids)]
-
+    # Min consensus: count number of distinct books contributing to the event in this df
+    # Assumes each row is one (event_id, book_key) quote.
+    depth = df.groupby("event_id")["book_key"].nunique().rename("consensus_depth")
+    df = df.merge(depth, left_on="event_id", right_index=True, how="left")
+    df = df[df["consensus_depth"] >= int(min_consensus)]
     if df.empty:
-        return JSONResponse(content={"picks": [], "note": "No rows after filters (consensus depth / freshness)."})
+        return {"picks": [], "note": "No rows after consensus depth filter."}
 
-    # Build consensus (median home no-vig per event)
-    cons = df.groupby("event_id", as_index=False)["home_q_novig"].median()
-    cons = cons.rename(columns={"home_q_novig": "consensus_home_q"})
-    merged = df.merge(cons, on="event_id", how="left")
+    # Compute edge vs consensus if not present; otherwise trust existing column
+    if "edge_vs_consensus" not in df.columns:
+        df["edge_vs_consensus"] = df["home_q_novig"] - df["consensus_home_q"]
 
-    # Edge vs consensus and abs edge
-    merged["edge_vs_consensus"] = merged["consensus_home_q"] - merged["home_q_novig"]
-    merged["abs_edge"] = merged["edge_vs_consensus"].abs()
+    # Min absolute edge (use per-request override if provided, else global default)
+    min_edge = GLOBAL_MIN_ABS_EDGE if (min_abs_edge is None) else float(min_abs_edge)
+    df["abs_edge"] = df["edge_vs_consensus"].abs()
+    df = df[df["abs_edge"] >= float(min_edge)]
+    if df.empty:
+        return {"picks": [], "note": "No rows after edge filter."}
 
-    # Filter and sort
-    filtered = merged[merged["abs_edge"] >= edge_thresh]
-    filtered = filtered.sort_values("abs_edge", ascending=False).head(row_limit)
+    # Sort and trim
+    max_rows = GLOBAL_LIMIT if (limit is None) else int(limit)
+    df = df.sort_values("abs_edge", ascending=False).head(max_rows)
 
-    out: List[Dict[str, Any]] = []
-    for row in filtered.itertuples():
-        out.append(
-            LivePick(
-                event_id=str(row.event_id),
-                sport_key=row.sport_key,
-                home_team=row.home_team,
-                away_team=row.away_team,
-                book_key=row.book_key,
-                home_q_novig=float(row.home_q_novig),
-                consensus_home_q=float(row.consensus_home_q),
-                edge_vs_consensus=float(row.edge_vs_consensus),
-            ).model_dump()
-        )
-
-    return JSONResponse(content={"picks": out})
+    # Select fields for response
+    cols = [
+        "event_id",
+        "sport_key",
+        "home_team",
+        "away_team",
+        "book_key",
+        "home_q_novig",
+        "consensus_home_q",
+        "edge_vs_consensus",
+    ]
+    # keep only existing cols (defensive)
+    cols = [c for c in cols if c in df.columns]
+    out = df[cols].to_dict(orient="records")
+    return {"picks": out}
