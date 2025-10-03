@@ -40,14 +40,14 @@ def picks_live(
     ),
 ):
     """
-    Returns rows where a book deviates from the event consensus (median of books).
-    Defaults: fullgame=1.5% edge, firsthalf=2.0% edge.
+    Defaults:
+      - fullgame  = 1.5% edge
+      - firsthalf = 1.0% edge  (more volatile, so slightly looser to surface opportunities)
     """
     try:
         # dynamic default
-        edge = 0.015 if source == "fullgame" else 0.020
-        if min_abs_edge is None:
-            min_abs_edge = edge
+        default_edge = 0.015 if source == "fullgame" else 0.010
+        edge_thresh = default_edge if min_abs_edge is None else float(min_abs_edge)
 
         df = _load_df(source)
 
@@ -67,7 +67,7 @@ def picks_live(
 
         out: List[Dict[str, Any]] = []
         for row in merged.itertuples():
-            if abs(row.edge_vs_consensus) < float(min_abs_edge):
+            if abs(row.edge_vs_consensus) < edge_thresh:
                 continue
             out.append(
                 LivePick(
@@ -86,8 +86,6 @@ def picks_live(
 
         return JSONResponse(content={"picks": out})
     except FileNotFoundError as e:
-        # File missing after deploy; clear message
         return JSONResponse(content={"picks": [], "note": str(e)})
     except Exception as e:
-        # Never return None; surface a safe error note
         return JSONResponse(content={"picks": [], "error": f"{e.__class__.__name__}: {e}"})
