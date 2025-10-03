@@ -17,14 +17,16 @@ class LivePick(BaseModel):
 
 @picks_live_router.get("/picks_live")
 def picks_live(
-    min_abs_edge: float = Query(0.03, ge=0, le=1),
-    limit: int = Query(25, ge=1, le=200),
-    source: str = Query("fullgame", pattern="^(fullgame|firsthalf)$"),
+    # Lower default so some picks show up out of the box
+    min_abs_edge: float = Query(0.01, ge=0, le=1, description="Minimum absolute edge vs consensus"),
+    limit: int = Query(30, ge=1, le=200, description="Max rows to return"),
+    source: str = Query("fullgame", pattern="^(fullgame|firsthalf)$",
+                        description="fullgame -> market_baselines_h2h.csv; firsthalf -> market_baselines_firsthalf.csv"),
 ):
     """
-    Show books deviating from consensus for:
-      - source=fullgame     -> data/processed/market_baselines_h2h.csv
-      - source=firsthalf    -> data/processed/market_baselines_firsthalf.csv (NBA/NFL/NCAAF H1, MLB F5)
+    Show books deviating from consensus:
+      - source=fullgame   -> data/processed/market_baselines_h2h.csv
+      - source=firsthalf  -> data/processed/market_baselines_firsthalf.csv (NBA/NFL/NCAAF H1, MLB F5)
     """
     path = (
         Path("./data/processed/market_baselines_h2h.csv")
@@ -46,6 +48,7 @@ def picks_live(
     merged["edge_vs_consensus"] = merged["consensus_home_q"] - merged["home_q_novig"]
 
     out = []
+    # Sort by absolute edge descending
     order = merged["edge_vs_consensus"].abs().sort_values(ascending=False).index
     for row in merged.reindex(order).itertuples():
         if abs(row.edge_vs_consensus) < min_abs_edge:
