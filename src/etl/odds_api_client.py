@@ -1,4 +1,3 @@
-
 import os
 import requests
 from typing import List, Dict
@@ -44,20 +43,21 @@ def get_odds(sport_key: str, regions: str="us", markets: str="h2h,spreads,totals
     }
     return r.json()
 
-def get_historical_odds(sport_key: str, date_iso: str, regions: str="us",
-                        markets: str="h2h,spreads,totals", odds_format: str="american"):
+def get_event_odds(sport_key: str, event_id: str, regions: str, markets: str, odds_format: str="american"):
+    """
+    Fetch odds for specific event-level period markets (e.g., first half/F5).
+    """
     _check_key()
-    url = f"{ODDS_API_HOST}/v4/historical/sports/{sport_key}/odds/"
+    url = f"{ODDS_API_HOST}/v4/sports/{sport_key}/events/{event_id}/odds/"
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": regions,
         "markets": markets,
-        "oddsFormat": odds_format,
-        "date": date_iso
+        "oddsFormat": odds_format
     }
-    r = requests.get(url, params=params, timeout=60)
+    r = requests.get(url, params=params, timeout=30)
     if r.status_code != 200:
-        raise OddsAPIError(f"/historical/odds failed: {r.status_code} {r.text}")
+        raise OddsAPIError(f"/events/{event_id}/odds failed: {r.status_code} {r.text}")
     r.quota = {
         "x-requests-remaining": r.headers.get("x-requests-remaining"),
         "x-requests-used": r.headers.get("x-requests-used"),
