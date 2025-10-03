@@ -4,8 +4,17 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pathlib import Path
 import pandas as pd
+import os
 
 picks_live_router = APIRouter()
+
+# ---------- Env-configurable defaults ----------
+# Change these in Render → Environment → Add Environment Variable
+DEF_FULLGAME_EDGE = float(os.getenv("PICKS_FULLGAME_MIN_EDGE", "0.015"))   # 1.5%
+DEF_FIRSTHALF_EDGE = float(os.getenv("PICKS_FIRSTHALF_MIN_EDGE", "0.010")) # 1.0%
+DEF_LIMIT = int(os.getenv("PICKS_DEFAULT_LIMIT", "50"))                    # max rows
+MIN_CONSENSUS_BOOKS = int(os.getenv("PICKS_MIN_CONSENSUS_BOOKS", "1"))    # require >= N books in consensus
+MAX_AGE_MINUTES = int(os.getenv("PICKS_MAX_AGE_MINUTES", "0"))            # 0 = ignore freshness
 
 class LivePick(BaseModel):
     event_id: str
@@ -30,9 +39,11 @@ def _load_df(source: str) -> pd.DataFrame:
 @picks_live_router.get("/picks_live")
 def picks_live(
     min_abs_edge: Optional[float] = Query(
-        None, ge=0, le=1, description="Minimum absolute edge vs consensus."
+        None, ge=0, le=1, description="Minimum absolute edge vs consensus. If omitted, uses env-configured default."
     ),
-    limit: int = Query(50, ge=1, le=200, description="Max rows to return."),
+    limit: int = Query(
+        None, ge=1, le=200, description="Max rows to return. If omitted, uses env-configured default."
+    ),
     source: str = Query(
         "fullgame",
         pattern="^(fullgame|firsthalf)$",
@@ -40,52 +51,31 @@ def picks_live(
     ),
 ):
     """
-    Defaults:
-      - fullgame  = 1.5% edge
-      - firsthalf = 1.0% edge  (more volatile, so slightly looser to surface opportunities)
+    Returns rows where a book deviates from the event consensus (median of books).
+
+    Defaults (override via env on Render):
+      - PICKS_FULLGAME_MIN_EDGE   (default 0.015)
+      - PICKS_FIRSTHALF_MIN_EDGE  (default 0.010)
+      - PICKS_DEFAULT_LIMIT       (default 50)
+      - PICKS_MIN_CONSENSUS_BOOKS (default 1)
+      - PICKS_MAX_AGE_MINUTES     (default 0 = ignore)
     """
     try:
-        # dynamic default
-        default_edge = 0.015 if source == "fullgame" else 0.010
-        edge_thresh = default_edge if min_abs_edge is None else float(min_abs_edge)
+        # dynamic defaults from env
+        edge_default = DEF_FULLGAME_EDGE if source == "fullgame" else DEF_FIRSTHALF_EDGE
+        edge_thresh = float(edge_default if min_abs_edge is None else min_abs_edge)
+        row_limit = int(DEF_LIMIT if limit is None else limit)
 
         df = _load_df(source)
 
-        # consensus: median home no-vig across books per event
-        cons = (
-            df.groupby("event_id", as_index=False)["home_q_novig"]
-            .median()
-            .rename(columns={"home_q_novig": "consensus_home_q"})
-        )
-        merged = df.merge(cons, on="event_id", how="left")
-        merged["edge_vs_consensus"] = merged["consensus_home_q"] - merged["home_q_novig"]
+        # Optional freshness filter (only if a last_update column is present)
+        if MAX_AGE_MINUTES > 0 and "last_update" in df.columns:
+            try:
+                ts = pd.to_datetime(df["last_update"], errors="coerce", utc=True)
+                cutoff = pd.Timestamp.utcnow() - pd.Timedelta(minutes=MAX_AGE_MINUTES)
+                df = df[ts >= cutoff]
+            except Exception:
+                # If parsing fails, just skip freshness filtering silently
+                pass
 
-        # sort by abs(edge) desc
-        merged = merged.reindex(
-            merged["edge_vs_consensus"].abs().sort_values(ascending=False).index
-        )
-
-        out: List[Dict[str, Any]] = []
-        for row in merged.itertuples():
-            if abs(row.edge_vs_consensus) < edge_thresh:
-                continue
-            out.append(
-                LivePick(
-                    event_id=str(row.event_id),
-                    sport_key=row.sport_key,
-                    home_team=row.home_team,
-                    away_team=row.away_team,
-                    book_key=row.book_key,
-                    home_q_novig=float(row.home_q_novig),
-                    consensus_home_q=float(row.consensus_home_q),
-                    edge_vs_consensus=float(row.edge_vs_consensus),
-                ).model_dump()
-            )
-            if len(out) >= limit:
-                break
-
-        return JSONResponse(content={"picks": out})
-    except FileNotFoundError as e:
-        return JSONResponse(content={"picks": [], "note": str(e)})
-    except Exception as e:
-        return JSONResponse(content={"picks": [], "error": f"{e.__class__.__name__}: {e}"})
+        # Require a minimum number of books contributing to the event consensus
