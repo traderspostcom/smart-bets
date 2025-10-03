@@ -1,17 +1,16 @@
 import os
 import requests
-from typing import List, Dict, Optional
+from typing import List, Dict
 
-# === Config & Budget ===
+# ===== Config & credit budget =====
 ODDS_API_HOST = os.getenv("ODDS_API_HOST", "https://api.the-odds-api.com")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
-# Hard caps to protect your credits; tune via env on Render/local
-MAX_REQUESTS_PER_RUN = int(os.getenv("ODDS_MAX_REQUESTS_PER_RUN", "40"))   # total requests allowed in a single run
-MIN_REMAINING_REQUIRED = int(os.getenv("ODDS_MIN_REMAINING", "5"))         # abort if provider says remaining < this
+# Hard caps so a run can't burn credits unexpectedly
+MAX_REQUESTS_PER_RUN = int(os.getenv("ODDS_MAX_REQUESTS_PER_RUN", "40"))  # total requests allowed per process
+MIN_REMAINING_REQUIRED = int(os.getenv("ODDS_MIN_REMAINING", "5"))        # abort if provider shows fewer remaining
 
-# Module-level counters
-_REQUESTS_USED_THIS_RUN = 0
+_requests_used = 0  # module-level counter
 
 class OddsAPIError(Exception):
     pass
@@ -21,42 +20,85 @@ def _check_key():
         raise OddsAPIError("Set ODDS_API_KEY in your environment or .env file.")
 
 def _enforce_budget():
-    global _REQUESTS_USED_THIS_RUN
-    if _REQUESTS_USED_THIS_RUN >= MAX_REQUESTS_PER_RUN:
+    global _requests_used
+    if _requests_used >= MAX_REQUESTS_PER_RUN:
         raise OddsAPIError(
-            f"Budget exceeded: used {_REQUESTS_USED_THIS_RUN} >= MAX_REQUESTS_PER_RUN={MAX_REQUESTS_PER_RUN}"
+            f"Budget exceeded: used {_requests_used} >= MAX_REQUESTS_PER_RUN={MAX_REQUESTS_PER_RUN}"
         )
 
-def _record_and_guard(resp: requests.Response):
-    """Record usage from headers and guard against low remaining credits."""
-    global _REQUESTS_USED_THIS_RUN
-    # Provider returns these headers; be tolerant if missing.
+def _record(resp: requests.Response):
+    """Increment local counter and stop if provider credits are very low."""
+    global _requests_used
+    _requests_used += 1
     try:
-        used = int(resp.headers.get("x-requests-used", "0"))
         remaining = int(resp.headers.get("x-requests-remaining", "999999"))
     except ValueError:
-        used, remaining = 0, 999999
-
-    # We don't always get cumulative 'used', so increment our own budget counter regardless.
-    _REQUESTS_USED_THIS_RUN += 1
-
-    # Abort early if remaining is below threshold
+        remaining = 999999
     if remaining < MIN_REMAINING_REQUIRED:
         raise OddsAPIError(
-            f"Provider shows low remaining credits ({remaining}) < MIN_REMAINING={MIN_REMAINING_REQUIRED}"
+            f"Low remaining credits: {remaining} < MIN_REMAINING_REQUIRED={MIN_REMAINING_REQUIRED}"
         )
 
 def _get(url: str, params: Dict) -> requests.Response:
     _enforce_budget()
     r = requests.get(url, params=params, timeout=30)
-    _record_and_guard(r)
+    _record(r)
     return r
 
-# ========== Public Client Functions ==========
+# ===== Public client functions =====
 
 def get_sports(all_sports: bool = False) -> List[Dict]:
     _check_key()
     params = {"apiKey": ODDS_API_KEY}
     if all_sports:
         params["all"] = "true"
-    url = f"{ODDS_AP_
+    url = f"{ODDS_API_HOST}/v4/sports/"
+    r = _get(url, params)
+    if r.status_code != 200:
+        raise OddsAPIError(f"/sports failed: {r.status_code} {r.text}")
+    return r.json()
+
+def get_odds(
+    sport_key: str,
+    regions: str = "us",
+    markets: str = "h2h,spreads,totals",
+    odds_format: str = "american",
+):
+    """
+    Full-game markets only. Period markets like h2h_h1 are NOT supported here.
+    """
+    _check_key()
+    url = f"{ODDS_API_HOST}/v4/sports/{sport_key}/odds/"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": regions,
+        "markets": markets,
+        "oddsFormat": odds_format,
+    }
+    r = _get(url, params)
+    if r.status_code != 200:
+        raise OddsAPIError(f"/odds failed: {r.status_code} {r.text}")
+    return r.json()
+
+def get_event_odds(
+    sport_key: str,
+    event_id: str,
+    regions: str,
+    markets: str,
+    odds_format: str = "american",
+):
+    """
+    Event-level odds for PERIOD markets (e.g., h2h_h1, h2h_1st_5_innings).
+    """
+    _check_key()
+    url = f"{ODDS_API_HOST}/v4/sports/{sport_key}/events/{event_id}/odds/"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": regions,
+        "markets": markets,
+        "oddsFormat": odds_format,
+    }
+    r = _get(url, params)
+    if r.status_code != 200:
+        raise OddsAPIError(f"/events/{event_id}/odds failed: {r.status_code} {r.text}")
+    return r.json()
