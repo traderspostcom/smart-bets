@@ -26,11 +26,10 @@ class LivePick(BaseModel):
     edge_vs_consensus: float
 
 def _path_for(source: str) -> Path:
-    return (
-        Path("./data/processed/market_baselines_h2h.csv")
-        if source == "fullgame"
-        else Path("./data/processed/market_baselines_firsthalf.csv")
-    )
+    if source == "fullgame":
+        return Path("./data/processed/market_baselines_h2h.csv")
+    else:
+        return Path("./data/processed/market_baselines_firsthalf.csv")
 
 def _load_df(source: str) -> pd.DataFrame:
     path = _path_for(source)
@@ -40,23 +39,15 @@ def _load_df(source: str) -> pd.DataFrame:
 
 @picks_live_router.get("/picks_live")
 def picks_live(
-    min_abs_edge: Optional[float] = Query(
-        None, ge=0, le=1, description="Minimum absolute edge vs consensus."
-    ),
-    limit: Optional[int] = Query(
-        None, ge=1, le=200, description="Max rows to return."
-    ),
-    source: str = Query(
-        "fullgame",
-        pattern="^(fullgame|firsthalf)$",
-        description="fullgame -> h2h file; firsthalf -> first-half/F5 file",
-    ),
+    min_abs_edge: Optional[float] = Query(None, ge=0, le=1, description="Minimum absolute edge vs consensus."),
+    limit: Optional[int] = Query(None, ge=1, le=200, description="Max rows to return."),
+    source: str = Query("fullgame", pattern="^(fullgame|firsthalf)$", description="Which baseline file to use."),
 ):
     """
     Returns rows where a book deviates from the event consensus (median of books).
-    Defaults come from environment variables (see README/Render config).
+    Defaults come from environment variables on Render.
     """
-    # Dynamic defaults from env
+    # dynamic defaults from env
     edge_default = DEF_FULLGAME_EDGE if source == "fullgame" else DEF_FIRSTHALF_EDGE
     edge_thresh = float(edge_default if min_abs_edge is None else min_abs_edge)
     row_limit = int(DEF_LIMIT if limit is None else limit)
@@ -82,14 +73,31 @@ def picks_live(
         return JSONResponse(content={"picks": [], "note": "No rows after filters (consensus depth / freshness)."})
 
     # Build consensus (median home no-vig per event)
-    cons = (
-        df.groupby("event_id", as_index=False)["home_q_novig"]
-        .median()
-        .rename(columns={"home_q_novig": "consensus_home_q"})
-    )
+    cons = df.groupby("event_id", as_index=False)["home_q_novig"].median()
+    cons = cons.rename(columns={"home_q_novig": "consensus_home_q"})
     merged = df.merge(cons, on="event_id", how="left")
-    merged["edge_vs_consensus"] = merged["consensus_home_q"] - merged["home_q_novig"]
 
-    # Sort by absolute edge and filter
-    merged = merged.reindex(
-        merged["edge_vs_consensus"].abs().sort_values(ascending=False).inde_
+    # Edge vs consensus and abs edge
+    merged["edge_vs_consensus"] = merged["consensus_home_q"] - merged["home_q_novig"]
+    merged["abs_edge"] = merged["edge_vs_consensus"].abs()
+
+    # Filter and sort
+    filtered = merged[merged["abs_edge"] >= edge_thresh]
+    filtered = filtered.sort_values("abs_edge", ascending=False).head(row_limit)
+
+    out: List[Dict[str, Any]] = []
+    for row in filtered.itertuples():
+        out.append(
+            LivePick(
+                event_id=str(row.event_id),
+                sport_key=row.sport_key,
+                home_team=row.home_team,
+                away_team=row.away_team,
+                book_key=row.book_key,
+                home_q_novig=float(row.home_q_novig),
+                consensus_home_q=float(row.consensus_home_q),
+                edge_vs_consensus=float(row.edge_vs_consensus),
+            ).model_dump()
+        )
+
+    return JSONResponse(content={"picks": out})
