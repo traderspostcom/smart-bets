@@ -1,168 +1,132 @@
-# src/app/admin.py
-from __future__ import annotations
-
-import os
-import sys
+from fastapi import APIRouter, Header, HTTPException, Query
 from pathlib import Path
 from subprocess import run, PIPE
-from typing import Dict, List, Tuple, Optional
+import os
+import time
 
-from fastapi import APIRouter, Header, HTTPException
-
-# ---------- Router ----------
 admin_router = APIRouter()
 
+DATA_DIR = Path("data")
+RAW = DATA_DIR / "raw"
+PROCESSED = DATA_DIR / "processed"
 
-# ---------- Helpers ----------
-def _require_token(x_cron_token: Optional[str]) -> None:
+def _require_token(x_cron_token: str | None):
     expected = os.getenv("CRON_TOKEN")
     if not expected or not x_cron_token or x_cron_token != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+def _run_py_module(module: str, args: list[str], timeout: int = 180):
+    cmd = ["python", "-m", module, *args]
+    p = run(cmd, stdout=PIPE, stderr=PIPE, text=True, timeout=timeout)
+    return p.returncode, p.stdout[-4000:], p.stderr[-4000:], cmd
 
-def _run(mod_and_args: List[str]) -> Tuple[int, str, str]:
-    """
-    Run a Python module with the SAME interpreter that runs FastAPI (your venv).
-    Example: _run(["-m", "src.etl.pull_odds_to_csv", "--sports", "baseball_mlb"])
-    """
-    cmd = [sys.executable, *mod_and_args]
-    p = run(cmd, stdout=PIPE, stderr=PIPE, text=True)
-    return p.returncode, p.stdout[-4000:], p.stderr[-4000:]
-
-
-def _csv_env(name: str, default_csv: str = "") -> List[str]:
-    raw = os.getenv(name, default_csv).strip()
-    if not raw:
-        return []
-    return [x.strip() for x in raw.split(",") if x.strip()]
-
-
-def _list_files_under(dir_path: Path) -> List[str]:
-    if not dir_path.exists():
-        return []
-    out: List[str] = []
-    for p in sorted(dir_path.rglob("*")):
-        if p.is_file():
-            rel = p.as_posix()
-            out.append(rel)
-    return out
-
-
-# ---------- Defaults / env controls ----------
-# Regions for the Odds API pulls (default to US + EU so you get Pinnacle)
-ODDS_API_REGIONS = os.getenv("ODDS_API_REGIONS", "us,eu")
-
-# Which sports to pull if not provided (you can override via SPORTS_ALLOWED env)
-DEFAULT_SPORTS = [
-    "americanfootball_nfl",
-    "icehockey_nhl",
-    "baseball_mlb",
-    "basketball_nba",
-    "americanfootball_ncaaf",
-]
-
-SPORTS_ALLOWED = _csv_env("SPORTS_ALLOWED") or DEFAULT_SPORTS
-
-# Optional: restrict consensus to certain books in post-processing steps (not enforced here;
-# the feature scripts can use BOOKS_ALLOWED too if you wired that up there)
-BOOKS_ALLOWED = _csv_env("BOOKS_ALLOWED")  # empty means "all books"
-
-
-# ---------- Admin endpoints ----------
-@admin_router.post("/admin/refresh_fullgame_safe")
-def refresh_fullgame_safe(x_cron_token: Optional[str] = Header(default=None)):
-    """
-    Pulls full-game moneyline odds (h2h) for allowed sports, then builds the consensus baseline file:
-      data/processed/market_baselines_h2h.csv
-    """
-    _require_token(x_cron_token)
-
-    sports = SPORTS_ALLOWED  # already a list
-    steps: List[Dict[str, str]] = []
-
-    # 1) Pull odds snapshot -> data/raw/odds_latest.csv
-    cmd1 = [
-        "-m",
-        "src.etl.pull_odds_to_csv",
-        "--sports",
-        *sports,
-        "--regions",
-        ODDS_API_REGIONS,
-        "--markets",
-        "h2h",
-    ]
-    code1, out1, err1 = _run(cmd1)
-    if code1 != 0:
-        return {"ok": False, "step": "pull_odds", "code": code1, "stdout": out1, "stderr": err1}
-    steps.append({"cmd": " ".join(cmd1), "stdout": out1, "stderr": err1})
-
-    # 2) Build no-vig consensus baselines -> data/processed/market_baselines_h2h.csv
-    cmd2 = ["-m", "src.features.make_baseline_from_odds"]
-    code2, out2, err2 = _run(cmd2)
-    if code2 != 0:
-        return {"ok": False, "step": "baseline_h2h", "code": code2, "stdout": out2, "stderr": err2}
-    steps.append({"cmd": " ".join(cmd2), "stdout": out2, "stderr": err2})
-
-    return {"ok": True, "steps": steps}
-
-
-@admin_router.post("/admin/refresh_firsthalf")
-def refresh_firsthalf(x_cron_token: Optional[str] = Header(default=None)):
-    """
-    Pulls period markets and builds the first-half (NBA/NFL/NCAAF) and F5 (MLB) baseline file:
-      data/processed/market_baselines_firsthalf.csv
-    """
-    _require_token(x_cron_token)
-
-    # The period puller decides which period markets to request per sport
-    # (e.g., NBA/NFL/NCAAF -> h2h_h1, MLB -> h2h_1st_5_innings)
-    sports = [s for s in SPORTS_ALLOWED if s in {
-        "basketball_nba", "americanfootball_nfl", "americanfootball_ncaaf", "baseball_mlb"
-    }]
-
-    steps: List[Dict[str, str]] = []
-
-    # 1) Pull period odds snapshot -> data/raw/odds_periods_latest.csv
-    cmd1 = [
-        "-m",
-        "src.etl.pull_period_odds_to_csv",
-        "--sports",
-        *sports,
-        "--regions",
-        ODDS_API_REGIONS,
-    ]
-    code1, out1, err1 = _run(cmd1)
-    if code1 != 0:
-        return {"ok": False, "step": "pull_period_odds", "code": code1, "stdout": out1, "stderr": err1}
-    steps.append({"cmd": " ".join(cmd1), "stdout": out1, "stderr": err1})
-
-    # 2) Build first-half / F5 baselines -> data/processed/market_baselines_firsthalf.csv
-    cmd2 = ["-m", "src.features.make_baseline_first_half"]
-    code2, out2, err2 = _run(cmd2)
-    if code2 != 0:
-        return {"ok": False, "step": "baseline_firsthalf", "code": code2, "stdout": out2, "stderr": err2}
-    steps.append({"cmd": " ".join(cmd2), "stdout": out2, "stderr": err2})
-
-    return {"ok": True, "steps": steps}
-
+def _size_or_zero(p: Path) -> int:
+    try:
+        return p.stat().st_size if p.exists() else 0
+    except Exception:
+        return 0
 
 @admin_router.get("/admin/list_files")
-def list_files(x_cron_token: Optional[str] = Header(default=None)):
-    """
-    Quick inventory for debugging what exists on disk inside the Render container.
-    """
+def list_files(x_cron_token: str | None = Header(default=None)):
+    _require_token(x_cron_token)
+    raw_files = [str(p) for p in RAW.glob("*") if p.is_file()]
+    proc_files = [str(p) for p in PROCESSED.glob("*") if p.is_file()]
+    return {"ok": True, "files": {"raw": raw_files, "processed": proc_files, "model_artifacts": []}}
+
+@admin_router.get("/admin/debug_paths")
+def debug_paths(x_cron_token: str | None = Header(default=None)):
+    _require_token(x_cron_token)
+    info = {
+        "cwd": os.getcwd(),
+        "env_keys": [k for k in os.environ.keys() if k in {
+            "CRON_TOKEN", "ODDS_API_KEY", "ODDS_API_HOST", "ODDS_API_REGIONS",
+            "ODDS_API_MARKETS", "SPORTS_ALLOWED", "BOOKS_ALLOWED",
+            "LIVE_MAX_AGE_MINUTES", "LIVE_MIN_BOOKS"
+        }],
+        "paths": {
+            "raw_dir": str(RAW), "processed_dir": str(PROCESSED),
+            "raw_dir_exists": RAW.exists(), "processed_dir_exists": PROCESSED.exists(),
+            "fullgame_path": str(PROCESSED / "market_baselines_h2h.csv"),
+            "firsthalf_path": str(PROCESSED / "market_baselines_firsthalf.csv"),
+            "fullgame_size": _size_or_zero(PROCESSED / "market_baselines_h2h.csv"),
+            "firsthalf_size": _size_or_zero(PROCESSED / "market_baselines_firsthalf.csv"),
+        },
+        "time": int(time.time()),
+    }
+    return {"ok": True, "debug": info}
+
+@admin_router.post("/admin/refresh_fullgame_safe")
+def refresh_fullgame_safe(
+    x_cron_token: str | None = Header(default=None),
+    sport: str | None = Query(default=None),
+):
     _require_token(x_cron_token)
 
-    root = Path(".")
-    raw = _list_files_under(root / "data" / "raw")
-    processed = _list_files_under(root / "data" / "processed")
-    artifacts = _list_files_under(root / "data" / "model_artifacts")
+    sports = [
+        "baseball_mlb",
+        "basketball_nba",
+        "americanfootball_nfl",
+        "americanfootball_ncaaf",
+        "icehockey_nhl",
+    ]
+    if sport:
+        sports = [sport]
 
-    return {
-        "ok": True,
-        "files": {
-            "raw": raw,
-            "processed": processed,
-            "model_artifacts": artifacts,
-        },
-    }
+    regions = os.getenv("ODDS_API_REGIONS", "us,eu")
+    markets = "h2h"
+
+    code1, out1, err1, cmd1 = _run_py_module(
+        "src.etl.pull_odds_to_csv",
+        ["--sports", *sports, "--regions", regions, "--markets", markets]
+    )
+    if code1 != 0:
+        return {"ok": False, "step": "pull_odds", "code": code1, "stdout": out1, "stderr": err1, "cmd": " ".join(cmd1)}
+
+    code2, out2, err2, cmd2 = _run_py_module(
+        "src.features.make_baseline_from_odds",
+        []
+    )
+    if code2 != 0:
+        return {"ok": False, "step": "baseline", "code": code2, "stdout": out2, "stderr": err2, "cmd": " ".join(cmd2)}
+
+    return {"ok": True, "steps": [
+        {"cmd": " ".join(cmd1), "stdout": out1, "stderr": err1},
+        {"cmd": " ".join(cmd2), "stdout": out2, "stderr": err2},
+    ]}
+
+@admin_router.post("/admin/refresh_firsthalf")
+def refresh_firsthalf(
+    x_cron_token: str | None = Header(default=None),
+    sport: str | None = Query(default=None),
+):
+    _require_token(x_cron_token)
+
+    sports = [
+        "baseball_mlb",
+        "basketball_nba",
+        "americanfootball_nfl",
+        "americanfootball_ncaaf",
+    ]
+    if sport:
+        sports = [sport]
+
+    regions = os.getenv("ODDS_API_REGIONS", "us,eu")
+
+    code1, out1, err1, cmd1 = _run_py_module(
+        "src.etl.pull_period_odds_to_csv",
+        ["--sports", *sports, "--regions", regions]
+    )
+    if code1 != 0:
+        return {"ok": False, "step": "pull_period_odds", "code": code1, "stdout": out1, "stderr": err1, "cmd": " ".join(cmd1)}
+
+    code2, out2, err2, cmd2 = _run_py_module(
+        "src.features.make_baseline_first_half",
+        []
+    )
+    if code2 != 0:
+        return {"ok": False, "step": "baseline_firsthalf", "code": code2, "stdout": out2, "stderr": err2, "cmd": " ".join(cmd2)}
+
+    return {"ok": True, "steps": [
+        {"cmd": " ".join(cmd1), "stdout": out1, "stderr": err1},
+        {"cmd": " ".join(cmd2), "stdout": out2, "stderr": err2},
+    ]}
