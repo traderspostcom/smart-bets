@@ -1,105 +1,136 @@
-from fastapi import FastAPI, Query
-from pydantic import BaseModel
-from pathlib import Path
-from subprocess import run, PIPE
+# src/app/main.py
 import os
+import sys
+import subprocess
+from datetime import datetime, timezone
+from typing import Optional, List
 
-# Routers (already in your repo)
-from .live import picks_live_router
-from .admin import admin_router
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Smart Bets")
+# Mount routes implemented in live.py (/picks_live and /admin/peek_csv)
+from .live import router as live_router
 
-# ---------- health ----------
-@app.get("/health")
+APP = FastAPI(title="Smart Bets")
+APP.include_router(live_router)
+
+CRON_TOKEN = os.getenv("CRON_TOKEN", "")
+RAW_DIR = "data/raw"
+PROC_DIR = "data/processed"
+FULLGAME_PATH = os.path.join(PROC_DIR, "market_baselines_h2h.csv")
+FIRSTHALF_PATH = os.path.join(PROC_DIR, "market_baselines_firsthalf.csv")
+
+
+def _need_auth(x_cron_token: Optional[str]) -> None:
+    if not CRON_TOKEN:
+        raise HTTPException(status_code=500, detail="CRON_TOKEN not set")
+    if x_cron_token != CRON_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _run(cmd: List[str]) -> dict:
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return {
+        "cmd": " ".join(cmd),
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+
+
+@APP.get("/health")
 def health():
     return {"ok": True}
 
-# ---------- optional /picks (kept compatible; returns a note if build_picks is unavailable) ----------
-class PicksResponse(BaseModel):
-    picks: list
 
-def _try_build_picks(min_edge: float, kelly_frac: float, max_risk_per_market: float, daily_risk_cap: float, bankroll: float):
-    try:
-        # Defer import so the app can still boot if training artifacts aren't present
-        from src.bet.engine import build_picks  # type: ignore
-        return build_picks(min_edge, kelly_frac, max_risk_per_market, daily_risk_cap, bankroll)
-    except Exception as e:
-        return {"note": f"build_picks unavailable: {e.__class__.__name__}: {e}"}
+@APP.get("/admin/list_files")
+def admin_list_files(x_cron_token: Optional[str] = Header(None)):
+    _need_auth(x_cron_token)
+    raw = [os.path.join(RAW_DIR, f) for f in sorted(os.listdir(RAW_DIR))] if os.path.isdir(RAW_DIR) else []
+    processed = [os.path.join(PROC_DIR, f) for f in sorted(os.listdir(PROC_DIR))] if os.path.isdir(PROC_DIR) else []
+    return {"ok": True, "files": {"raw": raw, "processed": processed, "model_artifacts": []}}
 
-@app.get("/picks", response_model=PicksResponse)
-def picks(
-    min_edge: float = Query(0.015, ge=0, le=1),
-    kelly_frac: float = Query(0.25, ge=0, le=1),
-    max_risk_per_market: float = Query(0.02, ge=0, le=1),
-    daily_risk_cap: float = Query(0.08, ge=0, le=1),
-    bankroll: float = Query(100000.0, ge=0),
+
+@APP.get("/admin/debug_paths")
+def admin_debug_paths(x_cron_token: Optional[str] = Header(None)):
+    _need_auth(x_cron_token)
+    return {
+        "ok": True,
+        "debug": {
+            "cwd": os.getcwd(),
+            "env_keys": sorted([k for k in os.environ.keys() if k in {
+                "ODDS_API_HOST", "BOOKS_ALLOWED", "ODDS_API_MARKETS", "ODDS_API_KEY",
+                "SPORTS_ALLOWED", "ODDS_API_REGIONS", "CRON_TOKEN", "LIVE_MIN_BOOKS"
+            }]),
+            "paths": {
+                "raw_dir": RAW_DIR,
+                "processed_dir": PROC_DIR,
+                "raw_dir_exists": os.path.isdir(RAW_DIR),
+                "processed_dir_exists": os.path.isdir(PROC_DIR),
+                "fullgame_path": FULLGAME_PATH,
+                "firsthalf_path": FIRSTHALF_PATH,
+                "fullgame_size": os.path.getsize(FULLGAME_PATH) if os.path.exists(FULLGAME_PATH) else 0,
+                "firsthalf_size": os.path.getsize(FIRSTHALF_PATH) if os.path.exists(FIRSTHALF_PATH) else 0,
+            },
+            "time": int(datetime.now(timezone.utc).timestamp()),
+        },
+    }
+
+
+@APP.post("/admin/refresh_fullgame_safe")
+def refresh_fullgame_safe(
+    sport: Optional[str] = None, x_cron_token: Optional[str] = Header(None)
 ):
-    data = _try_build_picks(min_edge, kelly_frac, max_risk_per_market, daily_risk_cap, bankroll)
-    # If build_picks returned a dict with a note, wrap it so the schema matches
-    if isinstance(data, dict):
-        return {"picks": [data]}
-    return {"picks": data}
+    _need_auth(x_cron_token)
 
-# Mount routers
-app.include_router(picks_live_router)
-app.include_router(admin_router)
+    sports = ["baseball_mlb", "basketball_nba", "americanfootball_nfl", "americanfootball_ncaaf", "icehockey_nhl"]
+    if sport:
+        sports = [sport]
 
-# ---------- helper ----------
-def _run(cmd: list[str]):
-    """Run a subprocess and log last 4000 chars of stdout/stderr; never crash server."""
-    p = run(cmd, stdout=PIPE, stderr=PIPE, text=True)
-    out, err = p.stdout[-4000:], p.stderr[-4000:]
-    if p.returncode != 0:
-        print(f"[BOOTSTRAP] ERROR {p.returncode} running: {' '.join(cmd)}\nSTDOUT:\n{out}\nSTDERR:\n{err}")
-    else:
-        print(f"[BOOTSTRAP] OK: {' '.join(cmd)}\n{out}")
-    return p.returncode, out, err
+    steps = []
+    steps.append(_run([
+        sys.executable, "-m", "src.etl.pull_odds_to_csv",
+        "--sports", *sports,
+        "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
+        "--markets", os.getenv("ODDS_API_MARKETS", "h2h"),
+    ]))
+    # IMPORTANT: call the v2 builder (long/wide tolerant)
+    steps.append(_run([sys.executable, "-m", "src.features.make_baseline_from_odds_v2"]))
 
-def _ensure_files_on_start():
-    """
-    Zero-cost bootstrap: if CSVs are missing after a deploy, rebuild safe subsets so /picks_live works.
-    - Full-game baseline: MLB only, markets=h2h
-    - First-half baseline: MLB F5 only, capped in its module
-    """
-    data_dir = Path("./data")
-    processed = data_dir / "processed"
-    processed.mkdir(parents=True, exist_ok=True)
+    ok = all(s["returncode"] == 0 for s in steps)
+    if not ok:
+        failing = next((s for s in steps if s["returncode"] != 0), steps[-1])
+        return JSONResponse(
+            {"ok": False, "step": "baseline" if "make_baseline" in failing["cmd"] else "pull", **failing},
+            status_code=500
+        )
+    return {"ok": True, "steps": steps}
 
-    regions = os.getenv("ODDS_API_REGIONS", "us,eu")
 
-    need_full = not (processed / "market_baselines_h2h.csv").exists()
-    need_first = not (processed / "market_baselines_firsthalf.csv").exists()
+@APP.post("/admin/refresh_firsthalf")
+def refresh_firsthalf(
+    sport: Optional[str] = None, x_cron_token: Optional[str] = Header(None)
+):
+    _need_auth(x_cron_token)
 
-    # Build MLB full-game (cheap, one sport)
-    if need_full:
-        _run([
-            "python", "-m", "src.etl.pull_odds_to_csv",
-            "--sports", "baseball_mlb",
-            "--regions", regions,
-            "--markets", "h2h",
-        ])
-        _run(["python", "-m", "src.features.make_baseline_from_odds"])
+    sports = ["baseball_mlb", "basketball_nba", "americanfootball_nfl", "americanfootball_ncaaf"]
+    if sport:
+        sports = [sport]
 
-    # Build MLB F5 (period odds)
-    if need_first:
-        _run([
-            "python", "-m", "src.etl.pull_period_odds_to_csv",
-            "--sports", "baseball_mlb",
-            "--regions", regions,
-            # puller itself is capped via its default; we can add --max_events "30" if needed
-        ])
-        _run(["python", "-m", "src.features.make_baseline_first_half"])
+    steps = []
+    steps.append(_run([
+        sys.executable, "-m", "src.etl.pull_period_odds_to_csv",
+        "--sports", *sports,
+        "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
+    ]))
+    # Keep current first-half builder for now; we can switch to v2 after full game is green
+    steps.append(_run([sys.executable, "-m", "src.features.make_baseline_first_half"]))
 
-# ---------- startup hook ----------
-@app.on_event("startup")
-def bootstrap_on_start():
-    # You can disable this by setting BOOTSTRAP_ON_START=0
-    if os.getenv("BOOTSTRAP_ON_START", "1") not in ("0", "false", "False"):
-        try:
-            _ensure_files_on_start()
-        except Exception as e:
-            # Never block the app from starting
-            print(f"[BOOTSTRAP] Exception during startup: {e.__class__.__name__}: {e}")
-
-# touch 2025-10-03T21:41:57
+    ok = all(s["returncode"] == 0 for s in steps)
+    if not ok:
+        failing = next((s for s in steps if s["returncode"] != 0), steps[-1])
+        return JSONResponse(
+            {"ok": False, "step": "baseline" if "make_baseline" in failing["cmd"] else "pull", **failing},
+            status_code=500
+        )
+    return {"ok": True, "steps": steps}
