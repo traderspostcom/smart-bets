@@ -10,16 +10,14 @@ from fastapi import APIRouter, Header, HTTPException
 
 admin_router = APIRouter()
 
-
 # --------------------- Auth helper ---------------------
 def _require_token(x_cron_token: Optional[str]):
     want = os.getenv("CRON_TOKEN", "")
     if not want:
-        # allow for local dev if the token isn't set
+        # allow local/dev when not set
         return
     if x_cron_token != want:
         raise HTTPException(status_code=401, detail="unauthorized")
-
 
 # ----------------- Subprocess helpers ------------------
 def _run_py_module(module_str: str, args: List[str]) -> Dict[str, Any]:
@@ -32,14 +30,12 @@ def _run_py_module(module_str: str, args: List[str]) -> Dict[str, Any]:
         "stderr": proc.stderr,
     }
 
-
 def _sanitize_markets(env_val: str) -> str:
     # Remove blanks & trailing commas. Only allow known keys.
     allow = {"h2h", "spreads", "totals"}
     parts = [p.strip() for p in (env_val or "").split(",") if p.strip()]
     parts = [p for p in parts if p in allow]
     return ",".join(parts)
-
 
 # ---------------- Introspection routes -----------------
 @admin_router.get("/admin/which_builder")
@@ -50,7 +46,6 @@ def which_builder(x_cron_token: Optional[str] = Header(None)):
         "fullgame_builder": "src.features.make_baseline_from_odds_v2",
         "firsthalf_builder": "src.features.make_baseline_first_half_v2",
     }
-
 
 @admin_router.get("/admin/list_files")
 def list_files(x_cron_token: Optional[str] = Header(None)):
@@ -68,7 +63,6 @@ def list_files(x_cron_token: Optional[str] = Header(None)):
                     elif rel.startswith(("models", "model_artifacts")):
                         paths["model_artifacts"].append(rel)
     return {"ok": True, "files": paths}
-
 
 @admin_router.get("/admin/debug_paths")
 def debug_paths(x_cron_token: Optional[str] = Header(None)):
@@ -118,7 +112,6 @@ def debug_paths(x_cron_token: Optional[str] = Header(None)):
         },
     }
 
-
 # ------------------- Build pipelines -------------------
 @admin_router.post("/admin/refresh_fullgame_safe")
 def refresh_fullgame_safe(x_cron_token: Optional[str] = Header(None)):
@@ -150,7 +143,6 @@ def refresh_fullgame_safe(x_cron_token: Optional[str] = Header(None)):
 
     return {"ok": True, "steps": [step1, step2]}
 
-
 @admin_router.post("/admin/refresh_firsthalf")
 def refresh_firsthalf(x_cron_token: Optional[str] = Header(None)):
     _require_token(x_cron_token)
@@ -173,7 +165,6 @@ def refresh_firsthalf(x_cron_token: Optional[str] = Header(None)):
         return {"ok": False, "step": "baseline", **step2}
 
     return {"ok": True, "steps": [step1, step2]}
-
 
 # -------- NEW: peek into first-half CSV to diagnose filters --------
 @admin_router.get("/admin/peek_firsthalf_sample")
