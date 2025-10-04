@@ -1,4 +1,4 @@
-# src/app/main.py
+﻿# src/app/main.py
 import os
 import sys
 import subprocess
@@ -94,7 +94,7 @@ def refresh_fullgame_safe(
         "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
         "--markets", os.getenv("ODDS_API_MARKETS", "h2h"),
     ]))
-    # IMPORTANT: call the v2 builder (long/wide tolerant)
+    # IMPORTANT: use the new v2 builder (long/wide tolerant)
     steps.append(_run([sys.executable, "-m", "src.features.make_baseline_from_odds_v2"]))
 
     ok = all(s["returncode"] == 0 for s in steps)
@@ -123,7 +123,7 @@ def refresh_firsthalf(
         "--sports", *sports,
         "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
     ]))
-    # Keep current first-half builder for now; we can switch to v2 after full game is green
+    # Keep current first-half builder for now; weâ€™ll upgrade after full-game is green
     steps.append(_run([sys.executable, "-m", "src.features.make_baseline_first_half"]))
 
     ok = all(s["returncode"] == 0 for s in steps)
