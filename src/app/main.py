@@ -8,10 +8,9 @@ from typing import Optional, List
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-# Mount routes implemented in live.py (/picks_live and /admin/peek_csv)
-from .live import router as live_router
+from .live import router as live_router  # only the router, no self-imports
 
-# IMPORTANT: uvicorn looks for a lowercase 'app' object here
+# IMPORTANT: uvicorn loads this 'app'
 app = FastAPI(title="Smart Bets")
 app.include_router(live_router)
 
@@ -42,6 +41,17 @@ def _run(cmd: List[str]) -> dict:
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+# Debug: prove which modules this instance will call
+@app.get("/admin/which_builder")
+def which_builder(x_cron_token: Optional[str] = Header(None)):
+    _need_auth(x_cron_token)
+    return {
+        "ok": True,
+        "fullgame_builder": "src.features.make_baseline_from_odds_v2",
+        "firsthalf_builder": "src.features.make_baseline_first_half",
+    }
 
 
 @app.get("/admin/list_files")
@@ -89,13 +99,14 @@ def refresh_fullgame_safe(
         sports = [sport]
 
     steps = []
+    # Pull odds
     steps.append(_run([
         sys.executable, "-m", "src.etl.pull_odds_to_csv",
         "--sports", *sports,
         "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
         "--markets", os.getenv("ODDS_API_MARKETS", "h2h"),
     ]))
-    # Use the long/wide-tolerant builder (v2)
+    # Build baseline with the new long/wide-tolerant builder
     steps.append(_run([sys.executable, "-m", "src.features.make_baseline_from_odds_v2"]))
 
     ok = all(s["returncode"] == 0 for s in steps)
@@ -124,7 +135,6 @@ def refresh_firsthalf(
         "--sports", *sports,
         "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
     ]))
-    # Keep current first-half builder for now; we’ll upgrade after full-game is green
     steps.append(_run([sys.executable, "-m", "src.features.make_baseline_first_half"]))
 
     ok = all(s["returncode"] == 0 for s in steps)
