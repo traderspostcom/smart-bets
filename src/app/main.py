@@ -1,4 +1,4 @@
-﻿# src/app/main.py
+# src/app/main.py
 import os
 import sys
 import subprocess
@@ -11,8 +11,9 @@ from fastapi.responses import JSONResponse
 # Mount routes implemented in live.py (/picks_live and /admin/peek_csv)
 from .live import router as live_router
 
-APP = FastAPI(title="Smart Bets")
-APP.include_router(live_router)
+# IMPORTANT: uvicorn looks for a lowercase 'app' object here
+app = FastAPI(title="Smart Bets")
+app.include_router(live_router)
 
 CRON_TOKEN = os.getenv("CRON_TOKEN", "")
 RAW_DIR = "data/raw"
@@ -38,12 +39,12 @@ def _run(cmd: List[str]) -> dict:
     }
 
 
-@APP.get("/health")
+@app.get("/health")
 def health():
     return {"ok": True}
 
 
-@APP.get("/admin/list_files")
+@app.get("/admin/list_files")
 def admin_list_files(x_cron_token: Optional[str] = Header(None)):
     _need_auth(x_cron_token)
     raw = [os.path.join(RAW_DIR, f) for f in sorted(os.listdir(RAW_DIR))] if os.path.isdir(RAW_DIR) else []
@@ -51,7 +52,7 @@ def admin_list_files(x_cron_token: Optional[str] = Header(None)):
     return {"ok": True, "files": {"raw": raw, "processed": processed, "model_artifacts": []}}
 
 
-@APP.get("/admin/debug_paths")
+@app.get("/admin/debug_paths")
 def admin_debug_paths(x_cron_token: Optional[str] = Header(None)):
     _need_auth(x_cron_token)
     return {
@@ -77,7 +78,7 @@ def admin_debug_paths(x_cron_token: Optional[str] = Header(None)):
     }
 
 
-@APP.post("/admin/refresh_fullgame_safe")
+@app.post("/admin/refresh_fullgame_safe")
 def refresh_fullgame_safe(
     sport: Optional[str] = None, x_cron_token: Optional[str] = Header(None)
 ):
@@ -94,7 +95,7 @@ def refresh_fullgame_safe(
         "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
         "--markets", os.getenv("ODDS_API_MARKETS", "h2h"),
     ]))
-    # IMPORTANT: use the new v2 builder (long/wide tolerant)
+    # Use the long/wide-tolerant builder (v2)
     steps.append(_run([sys.executable, "-m", "src.features.make_baseline_from_odds_v2"]))
 
     ok = all(s["returncode"] == 0 for s in steps)
@@ -107,7 +108,7 @@ def refresh_fullgame_safe(
     return {"ok": True, "steps": steps}
 
 
-@APP.post("/admin/refresh_firsthalf")
+@app.post("/admin/refresh_firsthalf")
 def refresh_firsthalf(
     sport: Optional[str] = None, x_cron_token: Optional[str] = Header(None)
 ):
@@ -123,7 +124,7 @@ def refresh_firsthalf(
         "--sports", *sports,
         "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
     ]))
-    # Keep current first-half builder for now; weâ€™ll upgrade after full-game is green
+    # Keep current first-half builder for now; we’ll upgrade after full-game is green
     steps.append(_run([sys.executable, "-m", "src.features.make_baseline_first_half"]))
 
     ok = all(s["returncode"] == 0 for s in steps)
