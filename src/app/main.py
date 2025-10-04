@@ -8,9 +8,8 @@ from typing import Optional, List
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-from .live import router as live_router  # only the router, no self-imports
+from .live import router as live_router  # router only
 
-# IMPORTANT: uvicorn loads this 'app'
 app = FastAPI(title="Smart Bets")
 app.include_router(live_router)
 
@@ -38,12 +37,17 @@ def _run(cmd: List[str]) -> dict:
     }
 
 
+def _sanitized_markets(default: str = "h2h") -> str:
+    raw = os.getenv("ODDS_API_MARKETS", default)
+    parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+    return ",".join(parts) if parts else default
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-# Debug: prove which modules this instance will call
 @app.get("/admin/which_builder")
 def which_builder(x_cron_token: Optional[str] = Header(None)):
     _need_auth(x_cron_token)
@@ -51,6 +55,7 @@ def which_builder(x_cron_token: Optional[str] = Header(None)):
         "ok": True,
         "fullgame_builder": "src.features.make_baseline_from_odds_v2",
         "firsthalf_builder": "src.features.make_baseline_first_half",
+        "markets_sanitized": _sanitized_markets(),
     }
 
 
@@ -94,19 +99,20 @@ def refresh_fullgame_safe(
 ):
     _need_auth(x_cron_token)
 
-    sports = ["baseball_mlb", "basketball_nba", "americanfootball_nfl", "americanfootball_ncaaf", "icehockey_nhl"]
+    sports = ["baseball_mlb", "basketball_nba", "americanfootball_nfl",
+              "americanfootball_ncaaf", "icehockey_nhl"]
     if sport:
         sports = [sport]
 
+    markets = _sanitized_markets("h2h")  # <— sanitize trailing commas / blanks
+
     steps = []
-    # Pull odds
     steps.append(_run([
         sys.executable, "-m", "src.etl.pull_odds_to_csv",
         "--sports", *sports,
         "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
-        "--markets", os.getenv("ODDS_API_MARKETS", "h2h"),
+        "--markets", markets,
     ]))
-    # Build baseline with the new long/wide-tolerant builder
     steps.append(_run([sys.executable, "-m", "src.features.make_baseline_from_odds_v2"]))
 
     ok = all(s["returncode"] == 0 for s in steps)
