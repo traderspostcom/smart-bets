@@ -1,5 +1,4 @@
-﻿
-# src/features/make_baseline_first_half_v2.py
+﻿# src/features/make_baseline_first_half_v2.py
 """
 Builds no-vig consensus baselines for **1st-half / F5** from long-form CSV
 written by: src.etl.pull_period_odds_to_csv
@@ -103,23 +102,29 @@ def _map_side(df: pd.DataFrame) -> pd.DataFrame:
     side[df["outcome_name"] == df["home_team"]] = "home"
     side[df["outcome_name"] == df["away_team"]] = "away"
 
-    df = df.copy()
-    df["side"] = side
-    return df[df["side"].isin(["home", "away"])]
+    out = df.copy()
+    out["side"] = side
+    return out[out["side"].isin(["home", "away"])]
+
+
+def _ensure_written(df_out: pd.DataFrame, reason: str):
+    """Always write the output file, even if 0 rows, and print a clear message."""
+    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+    df_out.to_csv(OUT_PATH, index=False)
+    print(f"Wrote {OUT_PATH} with {len(df_out)} rows ({reason})")
 
 
 def build_consensus() -> pd.DataFrame:
+    # If raw missing → write empty processed file
     if not os.path.exists(RAW_PATH) or os.path.getsize(RAW_PATH) == 0:
-        # Ensure the processed file exists even if raw is missing
-        os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
-        pd.DataFrame(columns=[
+        empty = pd.DataFrame(columns=[
             "event_id","sport_key","commence_time","home_team","away_team",
             "consensus_home_q","consensus_away_q",
             "consensus_home_fair_odds","consensus_away_fair_odds",
             "num_books","books_used","last_updated_utc",
-        ]).to_csv(OUT_PATH, index=False)
-        print(f"Wrote {OUT_PATH} with 0 rows (no raw file)")
-        return pd.read_csv(OUT_PATH)
+        ])
+        _ensure_written(empty, "no raw file")
+        return empty
 
     df = pd.read_csv(RAW_PATH)
 
@@ -131,22 +136,7 @@ def build_consensus() -> pd.DataFrame:
     if missing:
         raise ValueError(f"{RAW_PATH} missing columns: {sorted(list(missing))}")
 
-    # Keep only moneyline-ish markets for periods/F5 (be generous)
-    keep_markets = {"h2h", "moneyline", "ml", "h2h_1h", "h2h_h1", "h2h_first_half", "f5", "ml_f5"}
-    df = df[df["market_key"].astype(str).str.lower().isin(keep_markets)].copy()
-
-    if df.empty:
-        os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
-        empty = pd.DataFrame(columns=[
-            "event_id","sport_key","commence_time","home_team","away_team",
-            "consensus_home_q","consensus_away_q",
-            "consensus_home_fair_odds","consensus_away_fair_odds",
-            "num_books","books_used","last_updated_utc",
-        ])
-        empty.to_csv(OUT_PATH, index=False)
-        print(f"Wrote {OUT_PATH} with 0 rows (no matching markets)")
-        return empty
-
+    # ✅ Do NOT filter by market_key — accept anything we can side-map
     df = _filter_allowlists(df)
     df = _map_side(df)
 
@@ -154,16 +144,15 @@ def build_consensus() -> pd.DataFrame:
     df["q"] = df["price"].map(_american_to_prob)
     df = df[pd.notna(df["q"]) & (df["q"] > 0) & (df["q"] < 1)].copy()
 
+    # If nothing remains, still write an empty file so /picks_live doesn't complain
     if df.empty:
-        os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
         empty = pd.DataFrame(columns=[
             "event_id","sport_key","commence_time","home_team","away_team",
             "consensus_home_q","consensus_away_q",
             "consensus_home_fair_odds","consensus_away_fair_odds",
             "num_books","books_used","last_updated_utc",
         ])
-        empty.to_csv(OUT_PATH, index=False)
-        print(f"Wrote {OUT_PATH} with 0 rows (after side/prob filtering)")
+        _ensure_written(empty, "after side/prob filtering")
         return empty
 
     keys = ["event_id", "sport_key", "commence_time", "home_team", "away_team"]
@@ -197,15 +186,13 @@ def build_consensus() -> pd.DataFrame:
         "last_updated_utc_home": "last_updated_utc",
     }).copy()
 
-    if "books_used" not in out or out["books_used"].isna().all():
-        if "books_used_away" in pivot.columns:
-            out["books_used"] = pivot["books_used_away"]
-    if "num_books" not in out or out["num_books"].isna().all():
-        if "num_books_away" in pivot.columns:
-            out["num_books"] = pivot["num_books_away"]
-    if "last_updated_utc" not in out or out["last_updated_utc"].isna().all():
-        if "last_updated_utc_away" in pivot.columns:
-            out["last_updated_utc"] = pivot["last_updated_utc_away"]
+    # Fallbacks if home columns missing but away exist
+    if ("books_used" not in out or out["books_used"].isna().all()) and "books_used_away" in pivot.columns:
+        out["books_used"] = pivot["books_used_away"]
+    if ("num_books" not in out or out["num_books"].isna().all()) and "num_books_away" in pivot.columns:
+        out["num_books"] = pivot["num_books_away"]
+    if ("last_updated_utc" not in out or out["last_updated_utc"].isna().all()) and "last_updated_utc_away" in pivot.columns:
+        out["last_updated_utc"] = pivot["last_updated_utc_away"]
 
     out["consensus_home_fair_odds"] = out["consensus_home_q"].map(_prob_to_american)
     out["consensus_away_fair_odds"] = out["consensus_away_q"].map(_prob_to_american)
@@ -219,9 +206,7 @@ def build_consensus() -> pd.DataFrame:
     cols = [c for c in cols if c in out.columns]
     out = out[cols].copy()
 
-    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
-    out.to_csv(OUT_PATH, index=False)
-    print(f"Wrote {OUT_PATH} with {len(out)} rows")
+    _ensure_written(out, "success")
     return out
 
 
