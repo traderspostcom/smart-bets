@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Header, HTTPException, Query
+﻿from fastapi import APIRouter, Header, HTTPException, Query
 from pathlib import Path
 from subprocess import run, PIPE
 import os
@@ -83,7 +83,7 @@ def refresh_fullgame_safe(
         return {"ok": False, "step": "pull_odds", "code": code1, "stdout": out1, "stderr": err1, "cmd": " ".join(cmd1)}
 
     code2, out2, err2, cmd2 = _run_py_module(
-        "src.features.make_baseline_from_odds",
+        "src.features.make_baseline_from_odds_v2",
         []
     )
     if code2 != 0:
