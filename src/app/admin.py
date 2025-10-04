@@ -1,108 +1,200 @@
 # src/app/admin.py
+from __future__ import annotations
+
 import os
 import sys
+import json
 import subprocess
-from typing import Optional, List
+from typing import List, Dict, Any, Optional
 
 from fastapi import APIRouter, Header, HTTPException
-from fastapi.responses import JSONResponse
 
 admin_router = APIRouter()
 
-CRON_TOKEN = os.getenv("CRON_TOKEN", "")
-
-def _need_auth(x_cron_token: Optional[str]) -> None:
-    if not CRON_TOKEN:
-        raise HTTPException(status_code=500, detail="CRON_TOKEN not set")
-    if x_cron_token != CRON_TOKEN:
+# --- Auth helper (require x-cron-token on all /admin/*) -------------------------
+def _require_token(x_cron_token: Optional[str]):
+    want = os.getenv("CRON_TOKEN", "")
+    if not want:
+        # If no CRON_TOKEN configured, allow (useful for local dev)
+        return
+    if x_cron_token != want:
         raise HTTPException(status_code=401, detail="unauthorized")
 
-def _run_py_module(module: str, args: List[str]) -> tuple[int, str, str, str]:
-    cmd = [sys.executable, "-m", module] + args
+# --- Subprocess helpers ---------------------------------------------------------
+def _run_py_module(module_str: str, args: List[str]) -> Dict[str, Any]:
+    cmd = [sys.executable, "-m", module_str, *args]
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    return proc.returncode, proc.stdout, proc.stderr, " ".join(cmd)
+    return {
+        "cmd": " ".join(cmd),
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
 
-RAW_DIR = "data/raw"
-PROC_DIR = "data/processed"
-FULLGAME_PATH = os.path.join(PROC_DIR, "market_baselines_h2h.csv")
-FIRSTHALF_PATH = os.path.join(PROC_DIR, "market_baselines_firsthalf.csv")
+def _sanitize_markets(env_val: str) -> str:
+    # Remove blanks & trailing commas. Only allow known keys.
+    allow = {"h2h", "spreads", "totals"}
+    parts = [p.strip() for p in (env_val or "").split(",") if p.strip()]
+    parts = [p for p in parts if p in allow]
+    return ",".join(parts)
 
-# === Debug: tell us which builder module this router will call ===
+# --- Introspection endpoints ----------------------------------------------------
 @admin_router.get("/admin/which_builder")
 def which_builder(x_cron_token: Optional[str] = Header(None)):
-    _need_auth(x_cron_token)
+    _require_token(x_cron_token)
     return {
         "ok": True,
         "fullgame_builder": "src.features.make_baseline_from_odds_v2",
-        "firsthalf_builder": "src.features.make_baseline_first_half",  # unchanged for now
+        "firsthalf_builder": "src.features.make_baseline_first_half_v2",
     }
 
 @admin_router.get("/admin/list_files")
-def admin_list_files(x_cron_token: Optional[str] = Header(None)):
-    _need_auth(x_cron_token)
-    raw = [os.path.join(RAW_DIR, f) for f in sorted(os.listdir(RAW_DIR))] if os.path.isdir(RAW_DIR) else []
-    processed = [os.path.join(PROC_DIR, f) for f in sorted(os.listdir(PROC_DIR))] if os.path.isdir(PROC_DIR) else []
-    return {"ok": True, "files": {"raw": raw, "processed": processed, "model_artifacts": []}}
+def list_files(x_cron_token: Optional[str] = Header(None)):
+    _require_token(x_cron_token)
+    paths = {
+        "raw": [],
+        "processed": [],
+        "model_artifacts": [],
+    }
+    for p in ("data/raw", "data/processed", "models", "model_artifacts"):
+        if os.path.isdir(p):
+            for root, _, files in os.walk(p):
+                for f in files:
+                    rel = os.path.join(root, f)
+                    if rel.startswith("data/raw"):
+                        paths["raw"].append(rel)
+                    elif rel.startswith("data/processed"):
+                        paths["processed"].append(rel)
+                    elif rel.startswith("models") or rel.startswith("model_artifacts"):
+                        paths["model_artifacts"].append(rel)
+    return {"ok": True, "files": paths}
 
+@admin_router.get("/admin/debug_paths")
+def debug_paths(x_cron_token: Optional[str] = Header(None)):
+    _require_token(x_cron_token)
+    raw_dir = "data/raw"
+    processed_dir = "data/processed"
+    fullgame_path = os.path.join(processed_dir, "market_baselines_h2h.csv")
+    firsthalf_path = os.path.join(processed_dir, "market_baselines_firsthalf.csv")
+    def _size(p): 
+        try: return os.path.getsize(p)
+        except: return 0
+    return {
+        "ok": True,
+        "debug": {
+            "cwd": os.getcwd(),
+            "env_keys": sorted([k for k in os.environ.keys() if k in {
+                "ODDS_API_HOST","ODDS_API_KEY","ODDS_API_REGIONS","ODDS_API_MARKETS",
+                "BOOKS_ALLOWED","SPORTS_ALLOWED","CRON_TOKEN"
+            }]),
+            "paths": {
+                "raw_dir": raw_dir,
+                "processed_dir": processed_dir,
+                "raw_dir_exists": os.path.isdir(raw_dir),
+                "processed_dir_exists": os.path.isdir(processed_dir),
+                "fullgame_path": fullgame_path,
+                "firsthalf_path": firsthalf_path,
+                "fullgame_size": _size(fullgame_path),
+                "firsthalf_size": _size(firsthalf_path),
+            },
+            "time": int(__import__("time").time()),
+        }
+    }
+
+# --- Build pipelines ------------------------------------------------------------
 @admin_router.post("/admin/refresh_fullgame_safe")
-def refresh_fullgame_safe(
-    sport: Optional[str] = None,
-    x_cron_token: Optional[str] = Header(None),
-):
-    _need_auth(x_cron_token)
+def refresh_fullgame_safe(x_cron_token: Optional[str] = Header(None)):
+    _require_token(x_cron_token)
 
-    sports = ["baseball_mlb", "basketball_nba", "americanfootball_nfl", "americanfootball_ncaaf", "icehockey_nhl"]
-    if sport:
-        sports = [sport]
+    odds_api_markets = _sanitize_markets(os.getenv("ODDS_API_MARKETS", "h2h,spreads,totals"))
+    if not odds_api_markets:
+        odds_api_markets = "h2h"  # fallback
 
-    # Pull odds
-    code1, out1, err1, cmd1 = _run_py_module(
-        "src.etl.pull_odds_to_csv",
-        ["--sports", *sports, "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
-         "--markets", os.getenv("ODDS_API_MARKETS", "h2h")]
-    )
-    if code1 != 0:
-        return JSONResponse({"ok": False, "step": "pull", "code": code1, "stdout": out1, "stderr": err1, "cmd": cmd1}, status_code=500)
+    # 1) Pull odds (long form)
+    args_pull = [
+        "--sports", "baseball_mlb", "basketball_nba", "americanfootball_nfl", "americanfootball_ncaaf", "icehockey_nhl",
+        "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
+        "--markets", odds_api_markets,
+    ]
+    step1 = _run_py_module("src.etl.pull_odds_to_csv", args_pull)
+    if step1["returncode"] != 0:
+        return {"ok": False, "step": "pull", **step1}
 
-    # Build baseline (v2 long/wide tolerant)
-    code2, out2, err2, cmd2 = _run_py_module(
-        "src.features.make_baseline_from_odds_v2",
-        []
-    )
-    if code2 != 0:
-        return JSONResponse({"ok": False, "step": "baseline", "code": code2, "stdout": out2, "stderr": err2, "cmd": cmd2}, status_code=500)
+    # 2) Build full-game baselines (v2)
+    step2 = _run_py_module("src.features.make_baseline_from_odds_v2", [])
+    if step2["returncode"] != 0:
+        return {"ok": False, "step": "baseline", **step2}
 
-    return {"ok": True, "steps": [
-        {"cmd": cmd1, "returncode": code1, "stdout": out1, "stderr": err1},
-        {"cmd": cmd2, "returncode": code2, "stdout": out2, "stderr": err2},
-    ]}
+    return {"ok": True, "steps": [step1, step2]}
 
 @admin_router.post("/admin/refresh_firsthalf")
-def refresh_firsthalf(
-    sport: Optional[str] = None,
-    x_cron_token: Optional[str] = Header(None),
-):
-    _need_auth(x_cron_token)
+def refresh_firsthalf(x_cron_token: Optional[str] = Header(None)):
+    _require_token(x_cron_token)
 
-    sports = ["baseball_mlb", "basketball_nba", "americanfootball_nfl", "americanfootball_ncaaf"]
-    if sport:
-        sports = [sport]
+    # 1) Pull period/F5 odds
+    args_pull = [
+        "--sports", "baseball_mlb", "basketball_nba", "americanfootball_nfl", "americanfootball_ncaaf",
+        "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
+    ]
+    step1 = _run_py_module("src.etl.pull_period_odds_to_csv", args_pull)
+    if step1["returncode"] != 0:
+        return {"ok": False, "step": "pull", **step1}
 
-    code1, out1, err1, cmd1 = _run_py_module(
-        "src.etl.pull_period_odds_to_csv",
-        ["--sports", *sports, "--regions", os.getenv("ODDS_API_REGIONS", "us,eu")]
-    )
-    if code1 != 0:
-        return JSONResponse({"ok": False, "step": "pull", "code": code1, "stdout": out1, "stderr": err1, "cmd": cmd1}, status_code=500)
+    # 2) Build first-half/F5 baselines (v2)
+    step2 = _run_py_module("src.features.make_baseline_first_half_v2", [])
+    if step2["returncode"] != 0:
+        return {"ok": False, "step": "baseline", **step2}
 
-    code2, out2, err2, cmd2 = _run_py_module(
-        "src.features.make_baseline_first_half",
-        []
-    )
-    if code2 != 0:
-        return JSONResponse({"ok": False, "step": "baseline", "code": code2, "stdout": out2, "stderr": err2, "cmd": cmd2}, status_code=500)
+    return {"ok": True, "steps": [step1, step2]}
 
-    return {"ok": True, "steps": [
-        {"cmd": cmd1, "returncode": code1, "stdout": out1, "stderr": err1},
-        {"cmd": cmd2, "returncode": code2, "stdout": out2, "stderr": err2},
-    ]}
+# --- NEW: Peek into first-half CSV to diagnose filters --------------------------
+@admin_router.get("/admin/peek_firsthalf_sample")
+def peek_firsthalf_sample(limit: int = 10, x_cron_token: Optional[str] = Header(None)):
+    _require_token(x_cron_token)
+
+    import pandas as pd
+
+    path = "data/processed/market_baselines_firsthalf.csv"
+    if not os.path.exists(path):
+        return {"ok": False, "exists": False, "note": "missing file"}
+
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        return {"ok": False, "exists": True, "note": f"read failed: {e}"}
+
+    n = len(df)
+    cols = list(df.columns)
+
+    # Summaries that help explain why /picks_live may return []
+    summary = {}
+    for key in ("sport_key",):
+        if key in df.columns:
+            summary[f"counts_by_{key}"] = df[key].value_counts(dropna=False).to_dict()
+
+    for key in ("num_books",):
+        if key in df.columns:
+            summary["num_books_min"] = float(df[key].min()) if len(df) else None
+            summary["num_books_max"] = float(df[key].max()) if len(df) else None
+
+    if "books_used" in df.columns:
+        # show top distinct book-sets (trimmed)
+        top_sets = (
+            df["books_used"]
+            .fillna("")
+            .value_counts()
+            .head(10)
+            .to_dict()
+        )
+        summary["top_books_used_sets"] = top_sets
+
+    head_rows = df.head(limit).to_dict(orient="records")
+
+    return {
+        "ok": True,
+        "exists": True,
+        "rows": n,
+        "columns": cols,
+        "summary": summary,
+        "sample": head_rows,
+    }
