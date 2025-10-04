@@ -1,61 +1,131 @@
-from fastapi import FastAPI, Query
-from pydantic import BaseModel
-from pathlib import Path
+# src/app/live.py
+import os
+from typing import Optional
+
 import pandas as pd
+from fastapi import APIRouter, Query, Header, HTTPException
+from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Smart Bets", version="1.0.0")
+# NOTE: This module only defines a router.
+# DO NOT create a FastAPI() app here and DO NOT import this module from itself.
 
-DATA_DIR = Path("data")
-PROCESSED = DATA_DIR / "processed"
+router = APIRouter()
 
-class PicksResponse(BaseModel):
-    picks: list
+RAW_DIR = "data/raw"
+PROC_DIR = "data/processed"
+FULLGAME_PATH = os.path.join(PROC_DIR, "market_baselines_h2h.csv")
+FIRSTHALF_PATH = os.path.join(PROC_DIR, "market_baselines_firsthalf.csv")
+CRON_TOKEN = os.getenv("CRON_TOKEN", "")
 
-def _load_csv_safe(path: Path) -> pd.DataFrame | None:
-    try:
-        if not path.exists() or path.stat().st_size == 0:
-            return None
-        return pd.read_csv(path)
-    except Exception:
-        return None
+def _need_auth(x_cron_token: Optional[str]) -> None:
+    if not CRON_TOKEN:
+        raise HTTPException(status_code=500, detail="CRON_TOKEN not set")
+    if x_cron_token != CRON_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+def _read_csv_or_note(path: str) -> pd.DataFrame:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise FileNotFoundError(f"Missing or empty file: {os.path.basename(path)}")
+    return pd.read_csv(path)
 
-@app.get("/picks_live", response_model=PicksResponse)
-def picks_live(
-    source: str = Query("fullgame"),  # "fullgame" or "firsthalf"
-    min_abs_edge: float = Query(0.02, ge=0.0, le=1.0),
-    limit: int = Query(20, ge=1, le=500),
+def _apply_freshness_filter(df: pd.DataFrame) -> pd.DataFrame:
+    def _get_max_age_minutes(sk: Optional[str]) -> int:
+        if not sk:
+            return int(os.getenv("LIVE_MAX_AGE_MINUTES", "60"))
+        sk_upper = str(sk).upper()
+        per_key = f"LIVE_MAX_AGE_MINUTES__{sk_upper.replace('-', '_')}"
+        return int(os.getenv(per_key, os.getenv("LIVE_MAX_AGE_MINUTES", "60")))
+
+    if "last_updated_utc" in df.columns:
+        try:
+            ts = pd.to_datetime(df["last_updated_utc"], utc=True, errors="coerce")
+            now = pd.Timestamp.utcnow()
+            age_min = (now - ts).dt.total_seconds() / 60.0
+            if "sport_key" in df.columns:
+                def _row_keep(row):
+                    try:
+                        cap = _get_max_age_minutes(row.get("sport_key"))
+                    except Exception:
+                        cap = int(os.getenv("LIVE_MAX_AGE_MINUTES", "60"))
+                    return 0 <= row["_age_min"] <= cap
+                tmp = df.copy()
+                tmp["_age_min"] = age_min
+                df = tmp[tmp.apply(_row_keep, axis=1)].drop(columns=["_age_min"])
+            else:
+                max_age = int(os.getenv("LIVE_MAX_AGE_MINUTES", "60"))
+                df = df.loc[(age_min >= 0) & (age_min <= max_age)].copy()
+        except Exception:
+            pass
+    return df
+
+@router.get("/admin/peek_csv")
+def admin_peek_csv(
+    which: str = Query("fullgame", pattern="^(fullgame|firsthalf)$"),
+    x_cron_token: Optional[str] = Header(None),
 ):
-    if source == "firsthalf":
-        path = PROCESSED / "market_baselines_firsthalf.csv"
-    else:
-        path = PROCESSED / "market_baselines_h2h.csv"
+    _need_auth(x_cron_token)
+    path = FULLGAME_PATH if which == "fullgame" else FIRSTHALF_PATH
+    if not os.path.exists(path):
+        return JSONResponse({"ok": False, "error": f"missing {path}"}, status_code=404)
+    try:
+        df = pd.read_csv(path, nrows=200)
+        return {
+            "ok": True,
+            "path": path,
+            "columns": list(df.columns),
+            "rows_read": int(df.shape[0]),
+            "sample_rows": df.head(5).to_dict(orient="records"),
+        }
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e), "path": path}, status_code=500)
 
-    df = _load_csv_safe(path)
-    if df is None or df.empty:
-        note = f"Missing or empty file: {path.name}"
-        return {"picks": [], "note": note}
+@router.get("/picks_live")
+def picks_live(
+    source: Optional[str] = Query(None, pattern="^(firsthalf)$"),
+    min_abs_edge: float = 0.02,
+    limit: int = 20,
+):
+    path = FIRSTHALF_PATH if source == "firsthalf" else FULLGAME_PATH
 
-    required = {"event_id", "sport_key", "home_team", "away_team", "book_key", "home_q_novig", "consensus_home_q"}
-    if not required.issubset(df.columns):
-        missing = list(required - set(df.columns))
-        return {"picks": [], "note": f"CSV missing required columns: {missing}"}
+    try:
+        df = _read_csv_or_note(path)
+    except FileNotFoundError as e:
+        return {"picks": [], "note": str(e)}
 
-    df = df.copy()
-    df["edge_vs_consensus"] = df["home_q_novig"] - df["consensus_home_q"]
-    df = df[df["edge_vs_consensus"].abs() >= min_abs_edge]
-    df = df.sort_values(by="edge_vs_consensus", ascending=False)
+    needed = {"consensus_home_q", "consensus_away_q"}
+    if not needed.issubset(set(df.columns)):
+        return {
+            "picks": [],
+            "note": f"{os.path.basename(path)} missing columns: "
+                    f"{', '.join(sorted(list(needed.difference(set(df.columns)))))}",
+            "columns_present": list(df.columns),
+        }
 
-    out = df[["event_id","sport_key","home_team","away_team","book_key","home_q_novig","consensus_home_q","edge_vs_consensus"]] \
-            .head(limit).to_dict(orient="records")
+    min_books = int(os.getenv("LIVE_MIN_BOOKS", "3"))
+    if "num_books" in df.columns:
+        df = df[df["num_books"] >= max(1, min_books)].copy()
 
-    return {"picks": out}
+    df = _apply_freshness_filter(df)
 
-from .live import picks_live_router
-from .admin import admin_router
+    df["edge_home_abs"] = (df["consensus_home_q"] - 0.5).abs()
+    df = df[df["edge_home_abs"] >= float(min_abs_edge)]
 
-app.include_router(picks_live_router)
-app.include_router(admin_router)
+    cols_keep = [
+        "event_id", "sport_key", "commence_time",
+        "home_team", "away_team",
+        "consensus_home_q", "consensus_away_q",
+        "consensus_home_fair_odds", "consensus_away_fair_odds",
+        "num_books", "books_used", "last_updated_utc", "edge_home_abs",
+    ]
+    cols_exist = [c for c in cols_keep if c in df.columns]
+    df = df[cols_exist].copy()
+
+    if "edge_home_abs" in df.columns:
+        df = df.sort_values(["edge_home_abs", "commence_time"], ascending=[False, True])
+    elif "commence_time" in df.columns:
+        df = df.sort_values(["commence_time"], ascending=[True])
+
+    if limit > 0:
+        df = df.head(limit)
+
+    return {"picks": df.to_dict(orient="records")}
