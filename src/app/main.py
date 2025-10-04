@@ -54,7 +54,7 @@ def which_builder(x_cron_token: Optional[str] = Header(None)):
     return {
         "ok": True,
         "fullgame_builder": "src.features.make_baseline_from_odds_v2",
-        "firsthalf_builder": "src.features.make_baseline_first_half",
+        "firsthalf_builder": "src.features.make_baseline_first_half_v2",
         "markets_sanitized": _sanitized_markets(),
     }
 
@@ -104,7 +104,7 @@ def refresh_fullgame_safe(
     if sport:
         sports = [sport]
 
-    markets = _sanitized_markets("h2h")  # <— sanitize trailing commas / blanks
+    markets = _sanitized_markets("h2h")
 
     steps = []
     steps.append(_run([
@@ -141,7 +141,8 @@ def refresh_firsthalf(
         "--sports", *sports,
         "--regions", os.getenv("ODDS_API_REGIONS", "us,eu"),
     ]))
-    steps.append(_run([sys.executable, "-m", "src.features.make_baseline_first_half"]))
+    # 👉 Use the new v2 first-half builder
+    steps.append(_run([sys.executable, "-m", "src.features.make_baseline_first_half_v2"]))
 
     ok = all(s["returncode"] == 0 for s in steps)
     if not ok:
